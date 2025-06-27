@@ -57,7 +57,7 @@ pkg install git nodejs jq -y
 
 # Clonează repo și intră în folder
 git clone https://github.com/gyovannyvpn123/script-comenzi.git
-cd bot-comandsss
+cd script-comenzi
 
 # Dă permisiuni și rulează scriptul de instalare
 chmod +x install.sh
