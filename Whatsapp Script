@@ -1,0 +1,566 @@
+// Import the complete package and destructure what you need
+import pkg from '@borutowaileys/library';
+const { makeWASocket, useMultiFileAuthState, downloadMediaMessage } = pkg;
+const DisconnectReason = pkg.DisconnectReason;
+
+import Pino from "pino";
+import fs from "fs";
+import readline from "readline";
+import process from "process";
+import dns from "dns";
+import chalk from "chalk";
+import qrcode from "qrcode-terminal";
+
+// Helper for delay
+const delay = (ms) => new Promise((res) => setTimeout(res, ms));
+
+// Function to normalize JIDs (toLowerCase and trim extra spaces)
+function normalizeJid(jid) {
+  return jid ? jid.trim().toLowerCase() : "";
+}
+
+// Terminal input interface – toate mesajele pentru input sunt în română
+function askQuestion(query) {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+  return new Promise((resolve) => {
+    rl.question(chalk.red(query), (answer) => {
+      rl.close();
+      resolve(answer);
+    });
+  });
+}
+
+// Function to check for an internet connection; waits until the connection returns
+async function waitForInternet() {
+  console.log(chalk.red("⏳ Conexiunea a fost pierdută. Aștept conexiunea la internet..."));
+  return new Promise((resolve) => {
+    const interval = setInterval(() => {
+      dns.resolve("google.com", (err) => {
+        if (!err) {
+          console.log(chalk.red("✔ Conexiunea a revenit, reluăm trimiterea de unde a rămas."));
+          clearInterval(interval);
+          resolve(true);
+        }
+      });
+    }, 5000);
+  });
+}
+
+// Function to pre-check DNS resolution for web.whatsapp.com
+async function checkDNS() {
+  return new Promise((resolve, reject) => {
+    dns.lookup("web.whatsapp.com", (err) => {
+      if (err) reject(err);
+      else resolve(true);
+    });
+  });
+}
+
+// Banner – afișat în terminal (în română)
+console.log(chalk.red(`===================================
+        GYOVANNY WHATSAPP SCRIPT👑
+===================================`));
+
+// Global configuration for the bot (sending settings)
+global.botConfig = {};
+global.configReady = false; // Flag pentru a marca încărcarea completă a configurației
+
+// Global variable to retain the chosen connection method (1 = pairing code, 2 = QR code)
+global.connectionMethod = null;
+
+// Object for active sessions: key is chatId, value is { running, currentIndex, delay, mentionJids }
+let activeSessions = {};
+
+// Object for the group name-changing loop per chat
+let activeNameLoops = {};
+
+// Global variable for owner (set during pairing); only the owner can use comenzi speciale
+global.owner = null;
+
+/**
+ * Infinite loop that changes the group subject (name) periodically.
+ */
+async function groupNameLoop(chatId, sock) {
+  while (activeNameLoops[chatId] && activeNameLoops[chatId].running) {
+    const loopData = activeNameLoops[chatId];
+    const currentName = loopData.groupNames[loopData.currentIndex];
+    try {
+      await sock.groupUpdateSubject(chatId, currentName);
+      console.log(chalk.red(`[GroupNameLoop] Grupul ${chatId} a fost actualizat la: ${currentName}`));
+    } catch (error) {
+      console.error(chalk.red(`[GroupNameLoop] Eroare la schimbarea numelui grupului ${chatId}:`), error);
+    }
+    loopData.currentIndex = (loopData.currentIndex + 1) % loopData.groupNames.length;
+    await delay(loopData.delay);
+  }
+  console.log(chalk.red(`[GroupNameLoop] Sesiunea de schimbare nume pentru ${chatId} s-a încheiat.`));
+}
+
+/**
+ * Handles the /start command: creates or updates a session for sending messages/photos.
+ */
+async function handleStartCommand(chatId, delayValue, mentionJids, sock) {
+  if (activeSessions[chatId]) {
+    activeSessions[chatId].delay = delayValue;
+    activeSessions[chatId].mentionJids = mentionJids;
+    console.log(chalk.red(`Sesiunea pentru ${chatId} a fost actualizată.`));
+    return;
+  }
+  activeSessions[chatId] = {
+    running: true,
+    currentIndex: 0,
+    delay: delayValue,
+    mentionJids: mentionJids,
+  };
+
+  // Send first message instantly
+  const config = global.botConfig;
+  const session = activeSessions[chatId];
+  if (config.sendType === "mesaje" && config.messages.length) {
+    let textToSend = config.messages[session.currentIndex];
+    if (session.mentionJids.length) {
+      const mentionsText = session.mentionJids
+        .map((jid) => "@" + normalizeJid(jid).split("@")[0])
+        .join(" ");
+      textToSend = `${textToSend} ${mentionsText}`.trim();
+    }
+    try {
+      await sock.sendMessage(chatId, {
+        text: textToSend,
+        contextInfo: { mentionedJid: session.mentionJids },
+      });
+      console.log(chalk.red(`👑 Primul mesaj trimis către ${chatId}: "${textToSend}"`));
+    } catch (err) {
+      console.error(chalk.red("Eroare la trimiterea primului mesaj:"), err);
+    }
+  }
+  sendLoop(chatId, sock);
+}
+
+/**
+ * Handles the /stop command: stops a running session.
+ */
+function handleStopCommand(chatId) {
+  if (activeSessions[chatId]) {
+    activeSessions[chatId].running = false;
+    console.log(chalk.red(`Sesiunea pentru ${chatId} a fost oprită.`));
+  }
+}
+
+/**
+ * Core loop: sends messages or photos at intervals.
+ */
+async function sendLoop(chatId, sock) {
+  const config = global.botConfig;
+  let session = activeSessions[chatId];
+  let firstIteration = true;
+
+  while (session && session.running) {
+    if (!firstIteration) {
+      await delay(session.delay);
+    } else {
+      firstIteration = false;
+    }
+    try {
+      if (config.sendType === "mesaje") {
+        let textToSend = config.messages[session.currentIndex];
+        if (session.mentionJids.length) {
+          const mentionsText = session.mentionJids
+            .map((jid) => "@" + normalizeJid(jid).split("@")[0])
+            .join(" ");
+          textToSend = `${textToSend} ${mentionsText}`.trim();
+        }
+        await sock.sendMessage(chatId, {
+          text: textToSend,
+          contextInfo: { mentionedJid: session.mentionJids },
+        });
+        console.log(chalk.red(`👑 Mesaj trimis către ${chatId}: "${textToSend}"`));
+        session.currentIndex = (session.currentIndex + 1) % config.messages.length;
+      } else {
+        await sock.sendMessage(chatId, {
+          image: config.photoBuffer,
+          caption: config.photoCaption,
+          contextInfo: { mentionedJid: session.mentionJids },
+        });
+        console.log(chalk.red(`👑 Poză trimisă către ${chatId}.`));
+      }
+    } catch (error) {
+      console.error(chalk.red(`⇌ Eroare la trimiterea către ${chatId}:`), error);
+      console.log(chalk.red("⏳ Aștept revenirea internetului..."));
+      await waitForInternet();
+      console.log(chalk.red("🔄 Reinitializing connection..."));
+      return;
+    }
+    session = activeSessions[chatId];
+  }
+
+  if (activeSessions[chatId]) {
+    delete activeSessions[chatId];
+    console.log(chalk.red(`Sesiunea pentru ${chatId} s-a încheiat.`));
+  }
+}
+
+/**
+ * Resumes all active sessions after a reconnection.
+ */
+function resumeActiveSessions(sock) {
+  for (const chatId in activeSessions) {
+    if (activeSessions[chatId].running) {
+      console.log(chalk.red(`Reluăm trimiterea în conversația ${chatId}...`));
+      sendLoop(chatId, sock);
+    }
+  }
+}
+
+/**
+ * Extracts inner message from a quoted view-once message.
+ */
+function getInnerMessage(quotedMsg) {
+  if (quotedMsg.viewOnceMessage && quotedMsg.viewOnceMessage.message) {
+    return quotedMsg.viewOnceMessage.message;
+  }
+  return quotedMsg;
+}
+
+/**
+ * Sets up WhatsApp commands handler.
+ */
+function setupCommands(sock) {
+  sock.ev.on("messages.upsert", async (up) => {
+    if (!up.messages) return;
+    for (const msg of up.messages) {
+      if (!msg.message || !msg.key.fromMe || !global.configReady) continue;
+
+      const chatId = msg.key.remoteJid;
+      let text =
+        msg.message.conversation ||
+        msg.message.extendedTextMessage?.text;
+      if (!text) continue;
+      text = text.trim();
+
+      // reaction: hourglass
+      if (text.startsWith("/") || text === ".vv") {
+        try {
+          await sock.sendMessage(chatId, { react: { text: "⏳", key: msg.key } });
+        } catch {}
+      }
+
+      // .vv command: resend view-once media
+      if (text === ".vv") {
+        const ctx = msg.message.extendedTextMessage?.contextInfo;
+        if (!ctx?.quotedMessage) continue;
+        try {
+          const inner = getInnerMessage(ctx.quotedMessage);
+          const fakeMsg = {
+            key: {
+              remoteJid: chatId,
+              id: ctx.stanzaId || msg.key.id,
+              fromMe: false,
+              participant: ctx.participant,
+            },
+            message: inner,
+          };
+          const buffer = await downloadMediaMessage(
+            fakeMsg, "buffer", {}, { logger: Pino({ level: "silent" }), reuploadRequest: sock.updateMediaMessage }
+          );
+          let content = {};
+          if (inner.imageMessage) content = { image: buffer };
+          else if (inner.videoMessage) content = { video: buffer };
+          else if (inner.audioMessage) content = { audio: buffer };
+          else continue;
+          await sock.sendMessage(chatId, content);
+        } catch (err) {
+          console.error(chalk.red("Error .vv:"), err);
+        }
+        continue;
+      }
+
+      // only slash commands from here
+      if (!text.startsWith("/")) continue;
+
+      switch (true) {
+        case text.toLowerCase() === "/reload": {
+          try {
+            const fileContent = fs.readFileSync(global.botConfig.textPath, "utf8");
+            global.botConfig.messages = [fileContent];
+            await sock.sendMessage(chatId, { text: "🔁 Mesaj reîncărcat din fișier!" });
+          } catch (err) {
+            console.error(chalk.red("Eroare la /reload:"), err);
+          }
+          break;
+        }
+
+        case text.toLowerCase() === "/stopgroupname": {
+          if (activeNameLoops[chatId]) {
+            activeNameLoops[chatId].running = false;
+            delete activeNameLoops[chatId];
+          }
+          break;
+        }
+
+        case text.toLowerCase().startsWith("/groupname"): {
+          const m = text.match(/^\/groupname(\d+)\s+(.+)$/i);
+          if (m) {
+            const secs = parseInt(m[1], 10);
+            const names = m[2].split(",").map(n => n.trim()).filter(n => n);
+            if (names.length) {
+              activeNameLoops[chatId] = {
+                running: true,
+                delay: secs * 1000,
+                groupNames: names,
+                currentIndex: 0,
+              };
+              groupNameLoop(chatId, sock);
+            }
+          }
+          break;
+        }
+
+        case text.toLowerCase().startsWith("/kick"): {
+          if (!chatId.endsWith("@g.us")) break;
+          const tokens = text.split(/\s+/).slice(1);
+          let toKick = [];
+          if (tokens.includes("@all")) {
+            try {
+              const md = await sock.groupMetadata(chatId);
+              toKick = md.participants.map(p => p.id).filter(id => id !== global.owner);
+            } catch {}
+          } else {
+            for (const t of tokens) {
+              if (t.startsWith("@")) {
+                let id = t.slice(1);
+                if (!id.includes("@")) id += "@s.whatsapp.net";
+                toKick.push(id);
+              }
+            }
+          }
+          if (toKick.length) {
+            try {
+              await sock.groupParticipantsUpdate(chatId, toKick, "remove");
+            } catch {}
+          }
+          break;
+        }
+
+        case text.toLowerCase().startsWith("/add"): {
+          if (!chatId.endsWith("@g.us")) break;
+          const tokens = text.split(/\s+/).slice(1);
+          let toAdd = tokens.filter(t => t.startsWith("@")).map(t => {
+            let id = t.slice(1);
+            if (!id.includes("@")) id += "@s.whatsapp.net";
+            return id;
+          });
+          if (toAdd.length) {
+            try {
+              await sock.groupParticipantsUpdate(chatId, toAdd, "add");
+            } catch {}
+          }
+          break;
+        }
+
+        case text.toLowerCase() === "/stop": {
+          handleStopCommand(chatId);
+          break;
+        }
+
+        case text.toLowerCase().startsWith("/start"): {
+          const m = text.match(/^\/start(\d*)\s*(.*)$/i);
+          if (m) {
+            const d = m[1] ? parseInt(m[1],10)*1000 : global.botConfig.defaultDelay;
+            let mentions = [];
+            const rem = m[2].trim();
+            if (rem) {
+              if (rem.toLowerCase()==="@all" && chatId.endsWith("@g.us")) {
+                try {
+                  const md = await sock.groupMetadata(chatId);
+                  mentions = md.participants.map(p => p.id);
+                } catch {}
+              } else {
+                mentions = rem.split(/\s+/).filter(t=>t.startsWith("@")).map(t=>{
+                  let id=t.slice(1);
+                  if(!id.includes("@")) id+="@s.whatsapp.net";
+                  return id;
+                });
+              }
+            }
+            handleStartCommand(chatId, d, mentions, sock);
+          }
+          break;
+        }
+      } // end switch
+    }
+  });
+}
+
+/**
+ * Initializes bot configuration: choose type (mesaje/poze) and load files.
+ */
+async function initializeBotConfig(sock) {
+  if (global.botConfig.sendType) return setupCommands(sock);
+
+  let sendType = await askQuestion("Ce vrei să trimiți? (mesaje/poze): ");
+  sendType = sendType.toLowerCase();
+  if (sendType !== "mesaje" && sendType !== "poze") {
+    console.error(chalk.red("Opțiune invalidă!"));
+    process.exit(1);
+  }
+  global.botConfig.sendType = sendType;
+
+  if (sendType === "mesaje") {
+    const textPath = await askQuestion("Calea către fișierul .txt cu mesajul complet: ");
+    if (!fs.existsSync(textPath)) {
+      console.error(chalk.red("⛔ Fișierul nu există!"));
+      process.exit(1);
+    }
+    global.botConfig.messages = [fs.readFileSync(textPath, "utf8")];
+    global.botConfig.textPath = textPath;
+  } else {
+    const photoPath = await askQuestion("Calea către fișierul foto: ");
+    if (!fs.existsSync(photoPath)) {
+      console.error(chalk.red("⛔ Fișierul foto nu există!"));
+      process.exit(1);
+    }
+    global.botConfig.photoBuffer = fs.readFileSync(photoPath);
+    global.botConfig.photoCaption = await askQuestion("Caption (optional): ");
+  }
+
+  global.botConfig.defaultDelay = 5000;
+  console.log(chalk.red("\n✔ Configurare finalizată."));
+  console.log(chalk.red("👑 SCRIPTUL este gata! Folosește /start, /stop, /groupname, /stopgroupname, /add, /kick, .vv 👑"));
+
+  global.configReady = true;
+  setupCommands(sock);
+  resumeActiveSessions(sock);
+}
+
+/**
+ * Starts the WhatsApp bot: chooses auth method, handles connection updates.
+ */
+async function startBot() {
+  // Pre-check DNS before any connection attempt
+  try {
+    await checkDNS();
+  } catch (err) {
+    console.log(chalk.red("❌ DNS nu rezolvă web.whatsapp.com. Așteptăm..."));
+    await waitForInternet();
+    return startBot();
+  }
+
+  console.log(chalk.red("🔍 Pornire bot WhatsApp..."));
+
+  // Choose connection method if not yet set
+  if (!global.connectionMethod) {
+    console.log(chalk.red("=============================="));
+    console.log(chalk.red("   Alege metoda de conectare:"));
+    console.log(chalk.red("   1. Cod de asociere"));
+    console.log(chalk.red("   2. Cod QR"));
+    console.log(chalk.red("=============================="));
+    global.connectionMethod = await askQuestion("Numărul metodei (1 sau 2): ");
+  }
+  const choice = global.connectionMethod;
+
+  const { state, saveCreds } = await useMultiFileAuthState("./auth_info");
+  let sock;
+
+  // Method 1: pairing code
+  if (choice === "1") {
+    sock = makeWASocket({ auth: state, logger: Pino({ level: "silent" }), connectTimeoutMs: 60000 });
+    if (!sock.authState.creds.registered) {
+      const phoneNumber = await askQuestion("Număr de telefon (ex: 40756469325): ");
+      global.owner = normalizeJid(phoneNumber.includes("@") ? phoneNumber : `${phoneNumber}@s.whatsapp.net`);
+      try {
+        const pairingCode = await sock.requestPairingCode(phoneNumber);
+        console.log(chalk.red(`Cod de asociere: ${pairingCode}`));
+      } catch (e) {
+        console.error(chalk.red("Eroare pairing code:"), e);
+      }
+    } else {
+      if (!global.owner && sock.user?.id) {
+        global.owner = normalizeJid(sock.user.id);
+      }
+    }
+
+  // Method 2: QR code
+  } else if (choice === "2") {
+    sock = makeWASocket({
+      auth: state,
+      logger: Pino({ level: "silent" }),
+      connectTimeoutMs: 60000,
+      printQRInTerminal: false,
+    });
+    sock.ev.on("connection.update", (upd) => {
+      if (upd.qr) {
+        console.clear();
+        console.log(chalk.red("\nScanează codul QR cu telefonul (WhatsApp > Linked Devices > Link a Device):\n"));
+        qrcode.generate(upd.qr, { small: true });
+      }
+    });
+
+  } else {
+    console.error(chalk.red("Opțiune invalidă!"));
+    process.exit(1);
+  }
+
+  // Handler for WebSocket errors (ENOTFOUND etc.)
+  sock.ws.on("error", async (err) => {
+    if (err.code === "ENOTFOUND") {
+      console.log(chalk.red("❌ WebSocket ENOTFOUND – Așteptăm reconectarea..."));
+      await waitForInternet();
+      return startBot();
+    } else {
+      console.error(chalk.red("❌ WebSocket error caught:"), err);
+    }
+  });
+
+  // Robust reconnection logic
+  sock.ev.on("connection.update", async (update) => {
+    const { connection, lastDisconnect } = update;
+    const code = lastDisconnect?.error?.output?.statusCode;
+    const msg  = lastDisconnect?.error?.message || "";
+    const stale = msg.includes("ENOTFOUND");
+
+    if (connection === "open") {
+      console.log(chalk.red("✔ Conectat la WhatsApp!"));
+      if (global.botConfig.sendType) {
+        setupCommands(sock);
+        resumeActiveSessions(sock);
+      } else {
+        await initializeBotConfig(sock);
+      }
+    }
+
+    if (connection === "close") {
+      console.log(chalk.red("⏳ Conexiunea a fost pierdută."));
+      // Reconnect unless explicitly logged out
+      if (code !== DisconnectReason.loggedOut || stale) {
+        await waitForInternet();
+        console.log(chalk.red("🔁 Reîncercăm reconectarea..."));
+        try {
+          await startBot();
+        } catch (e) {
+          console.error(chalk.red("❌ Eroare la reconectare:"), e);
+          setTimeout(startBot, 10000);
+        }
+      } else {
+        console.log(chalk.red("⇌ Deconectare definitivă. Restart manual necesar."));
+        process.exit(1);
+      }
+    }
+  });
+
+  sock.ev.on("creds.update", saveCreds);
+}
+
+// Catch-all error handlers to at least log them
+process.on("uncaughtException", (err) => {
+  console.error(chalk.red("❌ uncaughtException:"), err);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error(chalk.red("❌ unhandledRejection:"), reason);
+});
+
+// Entrypoint
+startBot();
